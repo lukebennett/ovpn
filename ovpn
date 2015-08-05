@@ -1,0 +1,154 @@
+#!/bin/bash
+
+OVPN_LABEL=ovpn
+OVPN_DATA=$OVPN_LABEL-data
+OVPN_SERVER=$OVPN_LABEL-server
+OVPN_PROTOCOL=${OVPN_PROTOCOL:=udp}
+OVPN_PORT=${OVPN_PORT:=1194}
+
+check() {
+    if [ $(docker ps -a | grep $OVPN_SERVER | wc -l) -eq 0 ]; then
+        echo "No OpenVPN instance with this label ($OVPN_LABEL) is running."
+        exit
+    fi
+}
+
+backup() {
+    check
+    local mount_path=${1:=`pwd`/backups}
+    local dest_file=$2
+    dest_file=${dest_file:=ovpn-`date +"%s"`.tar.gz}
+    docker run --volumes-from $OVPN_DATA --rm -v $mount_path:/backup gliderlabs/alpine tar -czf /backup/$dest_file /etc/openvpn 2> /dev/null
+    echo "OpenVPN data backed up to $mount_path/$dest_file."
+}
+
+restore() {
+    check
+    local mount_path=${1:=`pwd`}
+    local src_file=$2
+    if [ -z $src_file ]; then
+        echo "OpenVPN backup location was not specified. Unable to restore."
+        exit
+    fi
+    docker run --volumes-from $OVPN_DATA --rm -v $mount_path:/backup -w='/' gliderlabs/alpine tar -C /etc/openvpn -xzf /backup/$src_file
+    [ $? -eq 0 ] && echo "OpenVPN data restored from $mount_path/$src_file."
+}
+
+start() {
+    shift
+    if [ $(docker ps -a | grep $OVPN_SERVER | wc -l) -gt 0 ]; then
+        echo "An OpenVPN instance with this name ($OVPN_LABEL) already exists. Please stop it first."
+        exit
+    fi
+    local ports=("$@")
+    local portmap=""
+    local portstr=""
+    for item in "${ports[@]}" ; do
+        local port=${item%%/*}
+        local protocol=${item#*/}
+        [[ "$port" != "$protocol" ]] || protocol="$OVPN_PROTOCOL"
+        portmap="$portmap-p $port:$OVPN_PORT/$protocol "
+        portstr="$portstr$port, "
+    done
+    portmap=${portmap:=-p $OVPN_PORT:1194/$OVPN_PROTOCOL}
+    portstr=${portstr%, }
+    local cid=$(docker run --restart=always --volumes-from $OVPN_DATA -d $portmap--cap-add=NET_ADMIN --name=$OVPN_SERVER kylemanna/openvpn)
+    [ $? -eq 0 ] && echo "OpenVPN has been started and is listening on port(s) $portstr. The container name is $OVPN_SERVER and its ID is $cid."
+}
+
+stop() {
+    check
+    docker stop $OVPN_SERVER 1> /dev/null
+    docker rm $OVPN_SERVER 1> /dev/null
+    [ $? -eq 0 ] && echo "OpenVPN has been stopped ($OVPN_LABEL)." 
+}
+
+getovpn() {
+    check
+    docker run --volumes-from $OVPN_DATA --rm kylemanna/openvpn ovpn_getclient "$1" > "$1".ovpn
+}
+
+case "$1" in
+    "install")
+    OVPN_HOST=$2
+    if [ -z $OVPN_HOST ]; then
+        echo "OpenVPN hostname was not specified. Unable to install."
+        exit
+    fi
+    if [ $(docker ps -a | grep $OVPN_DATA | wc -l) -eq 0 ]; then
+        docker run --name $OVPN_DATA -v /etc/openvpn gliderlabs/alpine /bin/sh
+    fi
+    docker run --volumes-from $OVPN_DATA --rm kylemanna/openvpn ovpn_genconfig -N -u $OVPN_PROTOCOL://$OVPN_HOST
+    docker run --volumes-from $OVPN_DATA --rm -it kylemanna/openvpn ovpn_initpki
+    [ $? -eq 0 ] && echo "OpenVPN has been successfully installed as $OVPN_PROTOCOL://$OVPN_HOST."
+    ;;
+
+    "client")
+    check
+    docker run --volumes-from $OVPN_DATA --rm -it kylemanna/openvpn easyrsa build-client-full "$2" nopass
+    getovpn $2
+    ;;
+    
+    "getovpn")
+    getovpn $2
+    ;;
+    
+    "start")
+    start $@
+    ;;
+    
+    "stop")
+    stop
+    ;;
+    
+    "restart")
+    OVPN_PORTS=("ports" $(docker port $OVPN_SERVER | awk '{print $3}' | awk -F':' '{print $2}'))
+    stop
+    start ${OVPN_PORTS[@]}
+    ;;
+    
+    "uninstall")
+    stop
+    backup $2 $3
+    docker rm $OVPN_DATA 1> /dev/null
+    [ $? -eq 0 ] && echo "OpenVPN has been removed."
+    ;;
+    
+    "shell")
+    check
+    docker exec -ti $OVPN_SERVER /bin/bash -l
+    #docker run --volumes-from $OVPN_DATA -ti --rm -w /etc/openvpn gliderlabs/alpine /bin/sh -l
+    ;;
+
+    "config")
+    check
+    docker run --volumes-from $OVPN_DATA -ti --rm -w /etc/openvpn gliderlabs/alpine sh -c "apk-install nano && nano ovpn_env.sh && nano openvpn.conf"
+    ;;
+    
+    "logs")
+    check
+    docker logs $OVPN_SERVER
+    ;;
+
+    "reinstall")
+    check
+    OVPN_HOST=$2
+    if [ -z $OVPN_HOST ]; then
+        echo "OpenVPN hostname was not specified. Unable to reinstall."
+        exit
+    fi
+    stop
+    docker run --volumes-from $OVPN_DATA --rm kylemanna/openvpn ovpn_genconfig -u $OVPN_PROTOCOL://$OVPN_HOST
+    [ $? -eq 0 ] && echo "OpenVPN config has been successfully reinstall as $OVPN_PROTOCOL://$OVPN_HOST."
+    shift
+    start $@
+    ;;
+
+    "backup")
+    backup $2 $3
+    ;;
+    
+    "restore")
+    restore $2 $3
+    ;;
+esac
